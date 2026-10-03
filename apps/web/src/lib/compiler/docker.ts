@@ -3,6 +3,7 @@ import { readFile } from "fs/promises";
 import path from "path";
 import { ENGINE_FLAGS, LIMITS } from "@backslash/shared";
 import type { Engine } from "@backslash/shared";
+import { demoConfig } from "@/lib/demo/config";
 
 // ─── Docker Client ─────────────────────────────────
 
@@ -21,11 +22,16 @@ export function getDockerClient(): Docker {
 
 const COMPILER_IMAGE = process.env.COMPILER_IMAGE || "backslash-compiler";
 
-const COMPILE_TIMEOUT = parseInt(
+const BASE_COMPILE_TIMEOUT = parseInt(
   process.env.COMPILE_TIMEOUT ||
     String(LIMITS.COMPILE_TIMEOUT_DEFAULT),
   10
 );
+
+// Demo mode caps how long a single build may run, regardless of COMPILE_TIMEOUT.
+const COMPILE_TIMEOUT = demoConfig.enabled
+  ? Math.min(BASE_COMPILE_TIMEOUT, demoConfig.maxCompileTimeoutSeconds)
+  : BASE_COMPILE_TIMEOUT;
 
 const COMPILE_MEMORY = process.env.COMPILE_MEMORY ||
   LIMITS.COMPILE_MEMORY_DEFAULT;
@@ -35,8 +41,45 @@ const COMPILE_CPUS = parseFloat(
     String(LIMITS.COMPILE_CPUS_DEFAULT)
 );
 
-const STORAGE_PATH = process.env.STORAGE_PATH || "/data";
-const PROJECTS_VOLUME = process.env.PROJECTS_VOLUME || "backslash-project-data";
+const DEFAULT_STORAGE_PATH = "/data";
+const DEFAULT_PROJECTS_VOLUME = "backslash-project-data";
+
+export interface ProjectStorageMount {
+  Type: "volume" | "bind";
+  Source: string;
+  Target: string;
+  ReadOnly: false;
+}
+
+/**
+ * Resolves the project storage mount shared with ephemeral compiler containers.
+ *
+ * The app and worker run inside Docker but create compiler containers through
+ * the host Docker daemon. A bind mount therefore has to use the absolute path
+ * on the Docker host, not the path as seen inside the app/worker container.
+ */
+export function resolveProjectStorageMount(
+  env: NodeJS.ProcessEnv = process.env
+): ProjectStorageMount {
+  const target = env.STORAGE_PATH?.trim() || DEFAULT_STORAGE_PATH;
+  const bindPath = env.PROJECTS_BIND_PATH?.trim();
+
+  if (bindPath) {
+    return {
+      Type: "bind",
+      Source: bindPath,
+      Target: target,
+      ReadOnly: false,
+    };
+  }
+
+  return {
+    Type: "volume",
+    Source: env.PROJECTS_VOLUME?.trim() || DEFAULT_PROJECTS_VOLUME,
+    Target: target,
+    ReadOnly: false,
+  };
+}
 
 // ─── Types ─────────────────────────────────────────
 
@@ -53,6 +96,16 @@ export interface CompileContainerResult {
   timedOut: boolean;
   canceled: boolean;
   engineUsed: Exclude<Engine, "auto">;
+}
+
+/**
+ * Keep latexmk artifacts beside the entry file. Without an explicit output
+ * directory, latexmk writes them to its working directory even when the entry
+ * file lives in a nested folder (for example, `fulltime/resume.tex`).
+ */
+export function getCompileOutputDirectory(mainFile: string): string {
+  const normalizedMainFile = mainFile.replace(/\\/g, "/");
+  return path.posix.dirname(normalizedMainFile);
 }
 
 // ─── Helpers ───────────────────────────────────────
@@ -198,7 +251,8 @@ export async function detectEngine(
  * - PidsLimit: 256 (prevents fork bombs)
  * - Per-container memory and CPU limits
  *
- * The project directory is bind-mounted into the container at /work.
+ * Project storage is mounted at the same path used by the app and worker.
+ * Named volumes are used by default; PROJECTS_BIND_PATH enables a host bind.
  * Timeout is enforced via JS setTimeout + container.kill().
  * The container is always removed after use.
  */
@@ -216,13 +270,18 @@ export async function runCompileContainer(
   const engineFlag = ENGINE_FLAGS[engine];
   const memoryBytes = parseMemoryString(COMPILE_MEMORY);
   const nanoCpus = Math.floor(COMPILE_CPUS * 1e9);
+  const projectStorageMount = resolveProjectStorageMount();
+  const outputDirectory = getCompileOutputDirectory(mainFile);
 
-  console.log(`[Docker] Engine: ${engine}, Image: ${COMPILER_IMAGE}, Volume: ${PROJECTS_VOLUME} -> ${STORAGE_PATH}`);
+  console.log(
+    `[Docker] Engine: ${engine}, Image: ${COMPILER_IMAGE}, Storage: ${projectStorageMount.Type}:${projectStorageMount.Source} -> ${projectStorageMount.Target}`
+  );
 
   const cmd = [
     "latexmk",
     engineFlag,
     "-gg",
+    `-outdir=${outputDirectory}`,
     "-interaction=nonstopmode",
     "-halt-on-error",
     "-file-line-error",
@@ -253,14 +312,7 @@ export async function runCompileContainer(
       WorkingDir: projectDir,
       NetworkDisabled: true,
       HostConfig: {
-        Mounts: [
-          {
-            Type: "volume" as const,
-            Source: PROJECTS_VOLUME,
-            Target: STORAGE_PATH,
-            ReadOnly: false,
-          },
-        ],
+        Mounts: [projectStorageMount],
         Memory: memoryBytes,
         NanoCpus: nanoCpus,
         PidsLimit: 256,
